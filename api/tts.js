@@ -1,17 +1,54 @@
-import { MsEdgeTTS, OUTPUT_FORMAT } from "msedge-tts";
-
-const DEFAULT_VOICE = "en-IN-NeerjaNeural";
-const MAX_TEXT_LENGTH = 4000;
-
-// WAV / RIFF PCM.
-// We will remove the WAV container header and return pure PCM.
-const OUTPUT_AUDIO_FORMAT =
-  OUTPUT_FORMAT.RIFF_24KHZ_16BIT_MONO_PCM;
+import {
+  EdgeTTS,
+  Constants
+} from "@andresaya/edge-tts";
 
 
-function sendError(res, status, message) {
+const DEFAULT_VOICE =
+  "en-IN-NeerjaNeural";
+
+
+const MAX_TEXT_LENGTH =
+  4000;
+
+
+const PCM_FORMAT =
+  Constants.OUTPUT_FORMAT.RIFF_24KHZ_16BIT_MONO_PCM;
+
+
+/*
+============================================================
+ EVA EDGE TTS PROXY
+ ============================================================
+
+ FLOW:
+
+ HTTP request
+      ↓
+ EdgeTTS.synthesize()
+      ↓
+ complete WAV/PCM buffer
+      ↓
+ remove RIFF/WAV container
+      ↓
+ raw 24 kHz / 16-bit / mono PCM
+      ↓
+ HTTP response
+
+ ============================================================
+*/
+
+
+function sendError(
+  res,
+  status,
+  message
+) {
+
   if (!res.headersSent) {
-    res.statusCode = status;
+
+    res.statusCode =
+      status;
 
     res.setHeader(
       "Content-Type",
@@ -30,166 +67,26 @@ function sendError(res, status, message) {
 
 /*
 ============================================================
- EVA — COLLECT EDGE TTS AUDIO
-============================================================
-
-We intentionally collect the complete stream first.
-
-Reason:
-The previous implementation was directly piping the
-MsEdgeTTS stream into the Vercel response.
-
-Your Vercel logs showed:
-
-"Stream closed before the synthesis completed
-(no turn.end received)"
-
-So the HTTP response could finish with ZERO bytes.
-
-This version waits for the audio stream to finish,
-then sends one verified PCM response.
-*/
-
-
-function collectAudio(audioStream) {
-  return new Promise((resolve, reject) => {
-
-    const chunks = [];
-
-    let totalBytes = 0;
-    let settled = false;
-
-    function finishOk() {
-      if (settled) {
-        return;
-      }
-
-      settled = true;
-
-      resolve(
-        Buffer.concat(chunks, totalBytes)
-      );
-    }
-
-
-    function finishError(error) {
-      if (settled) {
-        return;
-      }
-
-      settled = true;
-
-      reject(error);
-    }
-
-
-    audioStream.on(
-      "data",
-      (chunk) => {
-
-        try {
-
-          const buffer =
-            Buffer.isBuffer(chunk)
-              ? chunk
-              : Buffer.from(chunk);
-
-          if (buffer.length === 0) {
-            return;
-          }
-
-          chunks.push(buffer);
-
-          totalBytes += buffer.length;
-
-        } catch (error) {
-
-          finishError(error);
-
-        }
-      }
-    );
-
-
-    audioStream.on(
-      "end",
-      () => {
-
-        console.log(
-          `[EVA-TTS] AUDIO END | bytes=${totalBytes}`
-        );
-
-        finishOk();
-
-      }
-    );
-
-
-    audioStream.on(
-      "error",
-      (error) => {
-
-        console.error(
-          "[EVA-TTS] AUDIO STREAM ERROR",
-          error
-        );
-
-        finishError(error);
-
-      }
-    );
-
-
-    audioStream.on(
-      "close",
-      () => {
-
-        console.log(
-          `[EVA-TTS] AUDIO CLOSE | bytes=${totalBytes}`
-        );
-
-        /*
-         * Some Node readable streams emit close after end.
-         *
-         * If audio data was already received, allow the
-         * collected data to be returned instead of treating
-         * close as an immediate zero-byte failure.
-         */
-
-        if (totalBytes > 0) {
-          finishOk();
-        }
-
-      }
-    );
-
-  });
-}
-
-
-/*
-============================================================
- EVA — REMOVE RIFF/WAV HEADER
+ REMOVE RIFF/WAV CONTAINER
 ============================================================
 */
 
-function extractPCM(buffer) {
+function extractPCM(
+  buffer
+) {
 
-  if (!Buffer.isBuffer(buffer)) {
-    buffer = Buffer.from(buffer);
+  if (
+    !Buffer.isBuffer(buffer)
+  ) {
+
+    buffer =
+      Buffer.from(buffer);
   }
 
 
   /*
-   * Standard RIFF/WAVE begins with:
-   *
-   * 52 49 46 46 = RIFF
-   * ....
-   * 57 41 56 45 = WAVE
-   *
-   * Do not blindly assume 44 bytes.
+   * Check RIFF/WAVE
    */
-
 
   if (
     buffer.length >= 12 &&
@@ -207,8 +104,10 @@ function extractPCM(buffer) {
 
     let offset = 12;
 
+
     while (
-      offset + 8 <= buffer.length
+      offset + 8 <=
+      buffer.length
     ) {
 
       const chunkId =
@@ -218,22 +117,29 @@ function extractPCM(buffer) {
           offset + 4
         );
 
+
       const chunkSize =
         buffer.readUInt32LE(
           offset + 4
         );
 
 
-      if (chunkId === "data") {
+      if (
+        chunkId ===
+        "data"
+      ) {
 
         const dataStart =
           offset + 8;
 
+
         const dataEnd =
           Math.min(
-            dataStart + chunkSize,
+            dataStart +
+              chunkSize,
             buffer.length
           );
+
 
         return buffer.subarray(
           dataStart,
@@ -243,7 +149,8 @@ function extractPCM(buffer) {
 
 
       /*
-       * RIFF chunks are word aligned.
+       * RIFF chunks are
+       * word aligned.
        */
 
       offset +=
@@ -254,14 +161,13 @@ function extractPCM(buffer) {
 
 
     throw new Error(
-      "RIFF/WAVE header found but PCM data chunk was not found"
+      "RIFF/WAVE received but PCM data chunk was not found"
     );
   }
 
 
   /*
-   * If the package already returned raw PCM,
-   * accept it directly.
+   * Already raw PCM.
    */
 
   return buffer;
@@ -270,7 +176,7 @@ function extractPCM(buffer) {
 
 /*
 ============================================================
- EVA — MAIN VERCEL HANDLER
+ MAIN HANDLER
 ============================================================
 */
 
@@ -279,7 +185,16 @@ export default async function handler(
   res
 ) {
 
-  if (req.method !== "GET") {
+  /*
+   * --------------------------------------------------------
+   * METHOD
+   * --------------------------------------------------------
+   */
+
+  if (
+    req.method !==
+    "GET"
+  ) {
 
     res.setHeader(
       "Allow",
@@ -303,7 +218,8 @@ export default async function handler(
      */
 
     const text =
-      typeof req.query?.text === "string"
+      typeof req.query?.text ===
+      "string"
         ? req.query.text.trim()
         : "";
 
@@ -338,9 +254,13 @@ export default async function handler(
      */
 
     const voice =
-      typeof req.query?.voice === "string" &&
-      req.query.voice.trim().length > 0
+      typeof req.query?.voice ===
+        "string" &&
+      req.query.voice.trim()
+        .length > 0
+
         ? req.query.voice.trim()
+
         : DEFAULT_VOICE;
 
 
@@ -349,7 +269,7 @@ export default async function handler(
     );
 
     console.log(
-      `[EVA-TTS] START`
+      "[EVA-TTS] START"
     );
 
     console.log(
@@ -363,72 +283,58 @@ export default async function handler(
 
     /*
      * ------------------------------------------------------
-     * CREATE TTS
+     * CREATE EDGE TTS
      * ------------------------------------------------------
      */
 
     const tts =
-      new MsEdgeTTS();
-
-
-    await tts.setMetadata(
-      voice,
-      OUTPUT_AUDIO_FORMAT
-    );
-
-
-    console.log(
-      "[EVA-TTS] METADATA READY"
-    );
+      new EdgeTTS();
 
 
     /*
      * ------------------------------------------------------
-     * START SYNTHESIS
+     * SYNTHESIZE
      * ------------------------------------------------------
+     *
+     * IMPORTANT:
+     *
+     * We are NOT using msedge-tts.
+     *
+     * We let @andresaya/edge-tts handle the
+     * WebSocket turn lifecycle internally.
      */
 
-    const result =
-      tts.toStream(
-        text,
-        {
-          rate: 1,
-          pitch: "0Hz"
-        }
-      );
+    console.log(
+      "[EVA-TTS] SYNTHESIZE START"
+    );
 
 
-    if (
-      !result ||
-      !result.audioStream
-    ) {
-
-      throw new Error(
-        "Edge TTS did not return an audio stream"
-      );
-    }
+    await tts.synthesize(
+      text,
+      voice,
+      {
+        rate: "0%",
+        pitch: "0Hz",
+        volume: "100%",
+        outputFormat:
+          PCM_FORMAT
+      }
+    );
 
 
     console.log(
-      "[EVA-TTS] SYNTHESIS STREAM CREATED"
+      "[EVA-TTS] SYNTHESIZE COMPLETE"
     );
 
 
     /*
      * ------------------------------------------------------
-     * COLLECT COMPLETE AUDIO
+     * GET BUFFER
      * ------------------------------------------------------
      */
 
     const wavBuffer =
-      await collectAudio(
-        result.audioStream
-      );
-
-
-    console.log(
-      `[EVA-TTS] RAW STREAM BYTES=${wavBuffer.length}`
-    );
+      tts.toBuffer();
 
 
     if (
@@ -442,9 +348,14 @@ export default async function handler(
     }
 
 
+    console.log(
+      `[EVA-TTS] GENERATED BYTES=${wavBuffer.length}`
+    );
+
+
     /*
      * ------------------------------------------------------
-     * EXTRACT PURE PCM
+     * EXTRACT RAW PCM
      * ------------------------------------------------------
      */
 
@@ -452,11 +363,6 @@ export default async function handler(
       extractPCM(
         wavBuffer
       );
-
-
-    console.log(
-      `[EVA-TTS] PCM BYTES=${pcmBuffer.length}`
-    );
 
 
     if (
@@ -470,34 +376,44 @@ export default async function handler(
     }
 
 
-    /*
-     * ------------------------------------------------------
-     * PCM SANITY CHECK
-     * ------------------------------------------------------
-     *
-     * 24 kHz
-     * 16-bit
-     * mono
-     *
-     * 48,000 bytes/sec
-     */
-
-    const durationSeconds =
-      pcmBuffer.length / 48000;
-
-
     console.log(
-      `[EVA-TTS] PCM DURATION=${durationSeconds.toFixed(2)}s`
+      `[EVA-TTS] PCM BYTES=${pcmBuffer.length}`
     );
 
 
     /*
      * ------------------------------------------------------
-     * SEND RESPONSE
+     * AUDIO INFO
+     * ------------------------------------------------------
+     *
+     * 24,000 Hz
+     * 16-bit
+     * mono
+     *
+     * bytes/sec:
+     *
+     * 24000 × 2 × 1
+     * = 48000
+     */
+
+    const duration =
+      pcmBuffer.length /
+      48000;
+
+
+    console.log(
+      `[EVA-TTS] DURATION=${duration.toFixed(2)}s`
+    );
+
+
+    /*
+     * ------------------------------------------------------
+     * HTTP HEADERS
      * ------------------------------------------------------
      */
 
-    res.statusCode = 200;
+    res.statusCode =
+      200;
 
 
     res.setHeader(
@@ -508,7 +424,9 @@ export default async function handler(
 
     res.setHeader(
       "Content-Length",
-      String(pcmBuffer.length)
+      String(
+        pcmBuffer.length
+      )
     );
 
 
@@ -556,7 +474,7 @@ export default async function handler(
 
     /*
      * ------------------------------------------------------
-     * WRITE COMPLETE PCM
+     * SEND PCM
      * ------------------------------------------------------
      */
 
@@ -573,8 +491,9 @@ export default async function handler(
       "=================================================="
     );
 
-
-  } catch (error) {
+  } catch (
+    error
+  ) {
 
     console.error(
       "[EVA-TTS] ERROR",
@@ -602,7 +521,6 @@ export default async function handler(
       ) {
 
         res.end();
-
       }
 
       return;
