@@ -3,39 +3,49 @@ import {
   Constants
 } from "@andresaya/edge-tts";
 
+import {
+  MPEGDecoder
+} from "mpg123-decoder";
+
 
 const DEFAULT_VOICE =
   "en-IN-NeerjaNeural";
-
 
 const MAX_TEXT_LENGTH =
   4000;
 
 
-const PCM_FORMAT =
-  Constants.OUTPUT_FORMAT.RIFF_24KHZ_16BIT_MONO_PCM;
-
-
 /*
 ============================================================
- EVA EDGE TTS PROXY
- ============================================================
+ EVA EDGE TTS → MP3 → RAW PCM PROXY
+============================================================
 
- FLOW:
+ INPUT:
+   text
 
- HTTP request
-      ↓
- EdgeTTS.synthesize()
-      ↓
- complete WAV/PCM buffer
-      ↓
- remove RIFF/WAV container
-      ↓
- raw 24 kHz / 16-bit / mono PCM
-      ↓
- HTTP response
+ EDGE TTS:
+   24 kHz
+   mono
+   MP3
 
- ============================================================
+ DECODER:
+   mpg123 WASM
+
+ OUTPUT:
+   RAW PCM
+   24,000 Hz
+   16-bit
+   mono
+
+ OUTPUT BYTE RATE:
+
+   24000 samples
+   × 2 bytes
+   × 1 channel
+
+   = 48000 bytes/sec
+
+============================================================
 */
 
 
@@ -67,110 +77,186 @@ function sendError(
 
 /*
 ============================================================
- REMOVE RIFF/WAV CONTAINER
+ FLOAT32 → SIGNED 16-BIT PCM
 ============================================================
 */
 
-function extractPCM(
-  buffer
+function float32ToPCM16(
+  channelData
 ) {
 
-  if (
-    !Buffer.isBuffer(buffer)
+  const sampleCount =
+    channelData.length;
+
+
+  const output =
+    Buffer.allocUnsafe(
+      sampleCount * 2
+    );
+
+
+  for (
+    let i = 0;
+    i < sampleCount;
+    i++
   ) {
 
-    buffer =
-      Buffer.from(buffer);
-  }
+    let sample =
+      channelData[i];
 
 
-  /*
-   * Check RIFF/WAVE
-   */
+    /*
+     * Clamp to valid
+     * Float32 audio range.
+     */
 
-  if (
-    buffer.length >= 12 &&
-    buffer.toString(
-      "ascii",
-      0,
-      4
-    ) === "RIFF" &&
-    buffer.toString(
-      "ascii",
-      8,
-      12
-    ) === "WAVE"
-  ) {
+    if (sample > 1) {
+      sample = 1;
+    }
 
-    let offset = 12;
-
-
-    while (
-      offset + 8 <=
-      buffer.length
-    ) {
-
-      const chunkId =
-        buffer.toString(
-          "ascii",
-          offset,
-          offset + 4
-        );
-
-
-      const chunkSize =
-        buffer.readUInt32LE(
-          offset + 4
-        );
-
-
-      if (
-        chunkId ===
-        "data"
-      ) {
-
-        const dataStart =
-          offset + 8;
-
-
-        const dataEnd =
-          Math.min(
-            dataStart +
-              chunkSize,
-            buffer.length
-          );
-
-
-        return buffer.subarray(
-          dataStart,
-          dataEnd
-        );
-      }
-
-
-      /*
-       * RIFF chunks are
-       * word aligned.
-       */
-
-      offset +=
-        8 +
-        chunkSize +
-        (chunkSize % 2);
+    if (sample < -1) {
+      sample = -1;
     }
 
 
-    throw new Error(
-      "RIFF/WAVE received but PCM data chunk was not found"
+    /*
+     * Convert:
+
+       -1.0 → -32768
+        0.0 → 0
+       +1.0 → +32767
+    */
+
+    let value;
+
+
+    if (
+      sample < 0
+    ) {
+
+      value =
+        Math.round(
+          sample * 32768
+        );
+
+    } else {
+
+      value =
+        Math.round(
+          sample * 32767
+        );
+    }
+
+
+    output.writeInt16LE(
+      value,
+      i * 2
     );
   }
 
 
-  /*
-   * Already raw PCM.
-   */
+  return output;
+}
 
-  return buffer;
+
+/*
+============================================================
+ RESAMPLE MONO PCM
+============================================================
+
+ Edge TTS currently gives us 24 kHz.
+
+ We still keep this function so the output is guaranteed
+ to be exactly 24 kHz even if the upstream voice/output
+ changes later.
+
+============================================================
+*/
+
+function resampleMono(
+  samples,
+  inputRate,
+  outputRate
+) {
+
+  if (
+    inputRate ===
+    outputRate
+  ) {
+
+    return samples;
+  }
+
+
+  const outputLength =
+    Math.floor(
+      samples.length *
+      outputRate /
+      inputRate
+    );
+
+
+  const output =
+    new Float32Array(
+      outputLength
+    );
+
+
+  const ratio =
+    inputRate /
+    outputRate;
+
+
+  for (
+    let i = 0;
+    i < outputLength;
+    i++
+  ) {
+
+    const sourcePosition =
+      i * ratio;
+
+
+    const index =
+      Math.floor(
+        sourcePosition
+      );
+
+
+    const fraction =
+      sourcePosition -
+      index;
+
+
+    const sampleA =
+      samples[
+        Math.min(
+          index,
+          samples.length - 1
+        )
+      ];
+
+
+    const sampleB =
+      samples[
+        Math.min(
+          index + 1,
+          samples.length - 1
+        )
+      ];
+
+
+    output[i] =
+      sampleA +
+      (
+        sampleB -
+        sampleA
+      ) *
+      fraction;
+  }
+
+
+  return output;
 }
 
 
@@ -220,7 +306,9 @@ export default async function handler(
     const text =
       typeof req.query?.text ===
       "string"
+
         ? req.query.text.trim()
+
         : "";
 
 
@@ -292,16 +380,28 @@ export default async function handler(
 
 
     /*
+     * We ask Edge TTS for
+     * its working MP3 format.
+     *
+     * The previous test already proved that this
+     * produces valid audio.
+     */
+
+    const mp3Format =
+      Constants
+        .OUTPUT_FORMAT
+        .AUDIO_24KHZ_48KBITRATE_MONO_MP3;
+
+
+    console.log(
+      `[EVA-TTS] MP3 FORMAT=${mp3Format}`
+    );
+
+
+    /*
      * ------------------------------------------------------
      * SYNTHESIZE
      * ------------------------------------------------------
-     *
-     * IMPORTANT:
-     *
-     * We are NOT using msedge-tts.
-     *
-     * We let @andresaya/edge-tts handle the
-     * WebSocket turn lifecycle internally.
      */
 
     console.log(
@@ -317,7 +417,7 @@ export default async function handler(
         pitch: "0Hz",
         volume: "100%",
         outputFormat:
-          PCM_FORMAT
+          mp3Format
       }
     );
 
@@ -329,39 +429,229 @@ export default async function handler(
 
     /*
      * ------------------------------------------------------
-     * GET BUFFER
+     * GET MP3 BUFFER
      * ------------------------------------------------------
      */
 
-    const wavBuffer =
+    const mp3Buffer =
       tts.toBuffer();
 
 
     if (
-      !wavBuffer ||
-      wavBuffer.length === 0
+      !mp3Buffer ||
+      mp3Buffer.length === 0
     ) {
 
       throw new Error(
-        "Edge TTS returned zero audio bytes"
+        "Edge TTS returned zero MP3 bytes"
       );
     }
 
 
     console.log(
-      `[EVA-TTS] GENERATED BYTES=${wavBuffer.length}`
+      `[EVA-TTS] MP3 BYTES=${mp3Buffer.length}`
     );
 
 
     /*
      * ------------------------------------------------------
-     * EXTRACT RAW PCM
+     * INITIALIZE MPEG DECODER
+     * ------------------------------------------------------
+     */
+
+    console.log(
+      "[EVA-TTS] INITIALIZING MPEG DECODER"
+    );
+
+
+    const decoder =
+      new MPEGDecoder();
+
+
+    await decoder.ready;
+
+
+    console.log(
+      "[EVA-TTS] MPEG DECODER READY"
+    );
+
+
+    /*
+     * ------------------------------------------------------
+     * DECODE MP3
+     * ------------------------------------------------------
+     */
+
+    const decoded =
+      decoder.decode(
+        new Uint8Array(
+          mp3Buffer
+        )
+      );
+
+
+    if (!decoded) {
+
+      decoder.free();
+
+      throw new Error(
+        "MP3 decoder returned no data"
+      );
+    }
+
+
+    console.log(
+      `[EVA-TTS] DECODED SAMPLE RATE=${decoded.sampleRate}`
+    );
+
+
+    console.log(
+      `[EVA-TTS] DECODED SAMPLES=${decoded.samplesDecoded}`
+    );
+
+
+    /*
+     * ------------------------------------------------------
+     * DECODER ERRORS
+     * ------------------------------------------------------
+     */
+
+    if (
+      decoded.errors &&
+      decoded.errors.length > 0
+    ) {
+
+      console.warn(
+        `[EVA-TTS] DECODER WARNINGS=${decoded.errors.length}`
+      );
+
+
+      for (
+        const error
+        of decoded.errors
+      ) {
+
+        console.warn(
+          "[EVA-TTS] DECODER WARNING",
+          error
+        );
+      }
+    }
+
+
+    /*
+     * ------------------------------------------------------
+     * CHECK CHANNELS
+     * ------------------------------------------------------
+     */
+
+    if (
+      !decoded.channelData ||
+      decoded.channelData.length === 0
+    ) {
+
+      decoder.free();
+
+      throw new Error(
+        "MP3 decoder returned zero channels"
+      );
+    }
+
+
+    /*
+     * Edge TTS should give
+     * mono for our selected
+     * voice/format.
+     *
+     * If multiple channels somehow arrive,
+     * convert them to mono.
+     */
+
+    let monoSamples;
+
+
+    if (
+      decoded.channelData.length === 1
+    ) {
+
+      monoSamples =
+        decoded.channelData[0];
+
+    } else {
+
+      const left =
+        decoded.channelData[0];
+
+      const right =
+        decoded.channelData[1];
+
+
+      const count =
+        Math.min(
+          left.length,
+          right.length
+        );
+
+
+      monoSamples =
+        new Float32Array(
+          count
+        );
+
+
+      for (
+        let i = 0;
+        i < count;
+        i++
+      ) {
+
+        monoSamples[i] =
+          (
+            left[i] +
+            right[i]
+          ) *
+          0.5;
+      }
+    }
+
+
+    /*
+     * ------------------------------------------------------
+     * FREE DECODER
+     * ------------------------------------------------------
+     */
+
+    decoder.free();
+
+
+    /*
+     * ------------------------------------------------------
+     * GUARANTEE 24 KHZ
+     * ------------------------------------------------------
+     */
+
+    const pcmFloat =
+      resampleMono(
+        monoSamples,
+        decoded.sampleRate,
+        24000
+      );
+
+
+    console.log(
+      `[EVA-TTS] OUTPUT SAMPLES=${pcmFloat.length}`
+    );
+
+
+    /*
+     * ------------------------------------------------------
+     * FLOAT → INT16
      * ------------------------------------------------------
      */
 
     const pcmBuffer =
-      extractPCM(
-        wavBuffer
+      float32ToPCM16(
+        pcmFloat
       );
 
 
@@ -371,29 +661,15 @@ export default async function handler(
     ) {
 
       throw new Error(
-        "PCM extraction produced zero bytes"
+        "PCM conversion produced zero bytes"
       );
     }
 
 
-    console.log(
-      `[EVA-TTS] PCM BYTES=${pcmBuffer.length}`
-    );
-
-
     /*
      * ------------------------------------------------------
-     * AUDIO INFO
+     * AUDIO INFORMATION
      * ------------------------------------------------------
-     *
-     * 24,000 Hz
-     * 16-bit
-     * mono
-     *
-     * bytes/sec:
-     *
-     * 24000 × 2 × 1
-     * = 48000
      */
 
     const duration =
@@ -402,13 +678,18 @@ export default async function handler(
 
 
     console.log(
-      `[EVA-TTS] DURATION=${duration.toFixed(2)}s`
+      `[EVA-TTS] PCM BYTES=${pcmBuffer.length}`
+    );
+
+
+    console.log(
+      `[EVA-TTS] PCM DURATION=${duration.toFixed(2)}s`
     );
 
 
     /*
      * ------------------------------------------------------
-     * HTTP HEADERS
+     * HTTP RESPONSE
      * ------------------------------------------------------
      */
 
@@ -474,7 +755,7 @@ export default async function handler(
 
     /*
      * ------------------------------------------------------
-     * SEND PCM
+     * SEND RAW PCM
      * ------------------------------------------------------
      */
 
@@ -487,9 +768,11 @@ export default async function handler(
       `[EVA-TTS] COMPLETE | SENT=${pcmBuffer.length} PCM BYTES`
     );
 
+
     console.log(
       "=================================================="
     );
+
 
   } catch (
     error
@@ -530,7 +813,7 @@ export default async function handler(
     return sendError(
       res,
       502,
-      `Edge TTS synthesis failed: ${message}`
+      `Edge TTS conversion failed: ${message}`
     );
   }
 }
