@@ -1,5 +1,32 @@
 import { EdgeTTS } from '@andresaya/edge-tts';
 
+
+// ============================================================
+// EVA EDGE TTS PROXY
+//
+// TEST STAGE
+//
+// Output:
+//   RAW PCM
+//   24,000 Hz
+//   16-bit
+//   MONO
+//
+// IMPORTANT:
+//   This version intentionally uses:
+//
+//       synthesize()
+//       ↓
+//       toBuffer()
+//
+//   We are NOT using synthesizeStream() for PCM.
+//
+//   First objective:
+//   Generate a REAL non-zero PCM byte buffer from Edge TTS.
+//
+// ============================================================
+
+
 const PCM_FORMAT = 'raw-24khz-16bit-mono-pcm';
 
 const DEFAULT_VOICE = 'en-IN-NeerjaNeural';
@@ -8,51 +35,39 @@ const MAX_TEXT_LENGTH = 4000;
 
 
 // ============================================================
-// EVA EDGE TTS PROXY
-//
-// OUTPUT FORMAT:
-//
-//   RAW PCM
-//   24,000 Hz
-//   16-bit
-//   MONO
-//
-// IMPORTANT:
-//   No MP3
-//   No WAV header
-//   No Base64
-//   No JSON around audio
-//
-// EVA receives the HTTP body directly as PCM bytes.
+// ERROR RESPONSE
 // ============================================================
-
 
 function sendError(res, status, message) {
 
-  res.status(status);
+  if (!res.headersSent) {
 
-  res.setHeader(
-    'Content-Type',
-    'text/plain; charset=utf-8'
-  );
+    res.status(status);
 
-  res.setHeader(
-    'Cache-Control',
-    'no-store'
-  );
+    res.setHeader(
+      'Content-Type',
+      'text/plain; charset=utf-8'
+    );
+
+    res.setHeader(
+      'Cache-Control',
+      'no-store'
+    );
+
+  }
 
   res.end(message);
 }
 
 
 // ============================================================
-// MAIN VERCEL HANDLER
+// MAIN HANDLER
 // ============================================================
 
 export default async function handler(req, res) {
 
   // ----------------------------------------------------------
-  // Only GET is used by EVA firmware.
+  // GET ONLY
   // ----------------------------------------------------------
 
   if (req.method !== 'GET') {
@@ -67,27 +82,29 @@ export default async function handler(req, res) {
       405,
       'Method Not Allowed'
     );
+
   }
 
 
   try {
 
-    // --------------------------------------------------------
-    // READ QUERY PARAMETERS
-    //
-    // EVA sends:
-    //
-    // /tts?text=...&voice=...
-    // --------------------------------------------------------
+    // ========================================================
+    // READ TEXT
+    // ========================================================
 
     const rawText =
       typeof req.query?.text === 'string'
         ? req.query.text
         : '';
 
+
     const text =
       rawText.trim();
 
+
+    // ========================================================
+    // READ VOICE
+    // ========================================================
 
     const voice =
       typeof req.query?.voice === 'string' &&
@@ -98,9 +115,9 @@ export default async function handler(req, res) {
         : DEFAULT_VOICE;
 
 
-    // --------------------------------------------------------
+    // ========================================================
     // VALIDATE TEXT
-    // --------------------------------------------------------
+    // ========================================================
 
     if (!text) {
 
@@ -109,6 +126,7 @@ export default async function handler(req, res) {
         400,
         'Missing text parameter'
       );
+
     }
 
 
@@ -119,31 +137,97 @@ export default async function handler(req, res) {
         400,
         `Text is too long. Maximum is ${MAX_TEXT_LENGTH} characters.`
       );
+
     }
 
 
-    // --------------------------------------------------------
-    // CREATE EDGE TTS INSTANCE
-    // --------------------------------------------------------
+    console.log(
+      `[EVA-TTS] START | voice=${voice} | chars=${text.length}`
+    );
+
+
+    // ========================================================
+    // CREATE TTS
+    // ========================================================
 
     const tts =
       new EdgeTTS();
 
 
     // ========================================================
-    // HTTP AUDIO RESPONSE
+    // SYNTHESIZE COMPLETE PCM
     //
     // IMPORTANT:
     //
-    // application/octet-stream is intentional.
+    // RAW PCM is intentionally generated using synthesize().
     //
-    // EVA does NOT want:
-    //
-    // audio/mpeg
-    // audio/mp3
-    // audio/wav
-    //
-    // It wants pure PCM bytes.
+    // We are NOT using synthesizeStream() here.
+    // ========================================================
+
+    await tts.synthesize(
+      text,
+      voice,
+      {
+        outputFormat: PCM_FORMAT,
+
+        rate: 0,
+
+        pitch: 0,
+
+        volume: 0
+      }
+    );
+
+
+    // ========================================================
+    // GET RAW AUDIO BUFFER
+    // ========================================================
+
+    const audioBuffer =
+      tts.toBuffer();
+
+
+    // ========================================================
+    // SAFETY CHECK
+    // ========================================================
+
+    if (
+      !audioBuffer ||
+      audioBuffer.length === 0
+    ) {
+
+      console.error(
+        '[EVA-TTS] ERROR | Generated PCM buffer is EMPTY'
+      );
+
+      return sendError(
+        res,
+        502,
+        'Edge TTS returned zero audio bytes'
+      );
+
+    }
+
+
+    // ========================================================
+    // PCM DIAGNOSTICS
+    // ========================================================
+
+    const byteLength =
+      audioBuffer.length;
+
+
+    const estimatedSeconds =
+      byteLength / (24000 * 2);
+
+
+    console.log(
+      `[EVA-TTS] PCM READY | bytes=${byteLength} | seconds=${estimatedSeconds.toFixed(2)}`
+    );
+
+
+    // ========================================================
+    // HTTP RESPONSE
     // ========================================================
 
     res.statusCode = 200;
@@ -152,6 +236,12 @@ export default async function handler(req, res) {
     res.setHeader(
       'Content-Type',
       'application/octet-stream'
+    );
+
+
+    res.setHeader(
+      'Content-Length',
+      String(byteLength)
     );
 
 
@@ -180,6 +270,18 @@ export default async function handler(req, res) {
 
 
     res.setHeader(
+      'X-EVA-Audio-Bytes',
+      String(byteLength)
+    );
+
+
+    res.setHeader(
+      'X-EVA-Audio-Seconds',
+      estimatedSeconds.toFixed(3)
+    );
+
+
+    res.setHeader(
       'Cache-Control',
       'no-store, no-cache, must-revalidate'
     );
@@ -197,137 +299,61 @@ export default async function handler(req, res) {
     );
 
 
-    if (typeof res.flushHeaders === 'function') {
-      res.flushHeaders();
-    }
+    // ========================================================
+    // SEND PCM BYTES
+    //
+    // No:
+    //   MP3
+    //   WAV header
+    //   JSON
+    //   Base64
+    //
+    // ONLY PCM BYTES
+    // ========================================================
 
-
-    console.log(
-      `[EVA-TTS] START | voice=${voice} | chars=${text.length}`
+    res.end(
+      audioBuffer
     );
 
 
-    // ========================================================
-    // REAL-TIME EDGE TTS STREAM
-    //
-    // DO NOT collect the complete response in RAM.
-    //
-    // Every chunk is forwarded to EVA immediately.
-    // ========================================================
-
-    for await (
-      const chunk of tts.synthesizeStream(
-        text,
-        voice,
-        {
-          outputFormat: PCM_FORMAT,
-
-          rate: 0,
-
-          pitch: 0,
-
-          volume: 0
-        }
-      )
-    ) {
-
-      // ------------------------------------------------------
-      // Ignore empty chunks.
-      // ------------------------------------------------------
-
-      if (
-        !chunk ||
-        chunk.length === 0
-      ) {
-        continue;
-      }
-
-
-      // ------------------------------------------------------
-      // Stop if ESP32/client disconnected.
-      // ------------------------------------------------------
-
-      if (
-        res.writableEnded ||
-        res.destroyed
-      ) {
-        break;
-      }
-
-
-      // ------------------------------------------------------
-      // SEND PCM CHUNK TO EVA
-      // ------------------------------------------------------
-
-      const ok =
-        res.write(
-          Buffer.from(chunk)
-        );
-
-
-      // ------------------------------------------------------
-      // BACK-PRESSURE
-      //
-      // If the client is slower than the TTS producer,
-      // wait instead of building an unlimited RAM buffer.
-      // ------------------------------------------------------
-
-      if (!ok) {
-
-        await new Promise(
-          (resolve) => {
-
-            res.once(
-              'drain',
-              resolve
-            );
-
-          }
-        );
-      }
-
-    }
-
-
-    // --------------------------------------------------------
-    // FINISH HTTP STREAM
-    // --------------------------------------------------------
-
-    if (!res.writableEnded) {
-      res.end();
-    }
-
-
     console.log(
-      '[EVA-TTS] COMPLETE'
+      `[EVA-TTS] COMPLETE | sent=${byteLength} bytes`
     );
 
   }
 
+
   catch (error) {
 
     console.error(
-      '[EVA-TTS] ERROR',
+      '[EVA-TTS] ERROR:',
       error
     );
 
 
-    // --------------------------------------------------------
-    // IMPORTANT:
-    //
-    // Once PCM bytes have already been sent, NEVER send a
-    // text/JSON error into the same stream.
-    //
-    // That would become garbage PCM for EVA.
-    // --------------------------------------------------------
+    if (
+      error &&
+      typeof error === 'object' &&
+      'stack' in error
+    ) {
 
-    if (res.headersSent) {
+      console.error(
+        error.stack
+      );
+
+    }
+
+
+    if (
+      res.headersSent
+    ) {
 
       if (!res.writableEnded) {
         res.end();
       }
 
       return;
+
     }
 
 
@@ -336,6 +362,7 @@ export default async function handler(req, res) {
       502,
       'Edge TTS synthesis failed'
     );
+
   }
 
 }
