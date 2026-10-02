@@ -1,12 +1,13 @@
 {
   "name": "eva-edge-tts-proxy",
-  "version": "3.0.0",
+  "version": "4.0.0",
   "private": true,
   "type": "module",
   "engines": {
     "node": ">=18"
   },
   "dependencies": {
-    "@andresaya/edge-tts": "1.8.0"
+    "@andresaya/edge-tts": "1.8.0",
+    "mpg123-decoder": "1.0.3"
   }
 }
