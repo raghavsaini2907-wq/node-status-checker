@@ -360,7 +360,11 @@ export default async function handler(req, res) {
     return sendError(
       res,
       502,
-      'Edge TTS synthesis failed'
+      `Edge TTS synthesis failed: ${
+        error instanceof Error
+          ? error.message
+          : String(error)
+      }
     );
 
   }
