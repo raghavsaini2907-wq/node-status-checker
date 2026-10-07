@@ -1,4 +1,3 @@
-```javascript
 import { EdgeTTS } from "@andresaya/edge-tts";
 
 const VOICE_HI = "hi-IN-SwaraNeural";
@@ -279,4 +278,3 @@ export default async function handler(req, res) {
     });
   }
 }
-```
