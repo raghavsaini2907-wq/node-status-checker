@@ -1,15 +1,9 @@
 {
   "version": 2,
-  "rewrites": [
+  "routes": [
     {
-      "source": "/tts",
-      "destination": "/api/tts"
+      "src": "/tts",
+      "dest": "/api/tts.js"
     }
-  ],
-  "functions": {
-    "api/tts.js": {
-      "runtime": "nodejs20.x",
-      "maxDuration": 30
-    }
-  }
+  ]
 }
