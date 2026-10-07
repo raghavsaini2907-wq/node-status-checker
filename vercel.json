@@ -1,9 +1,33 @@
 {
   "version": 2,
-  "routes": [
+  "functions": {
+    "api/tts.js": {
+      "runtime": "nodejs24.x",
+      "memory": 1024,
+      "maxDuration": 60
+    }
+  },
+  "headers": [
     {
-      "src": "/tts",
-      "dest": "/api/tts.js"
+      "source": "/api/tts",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "no-store, no-cache, must-revalidate"
+        },
+        {
+          "key": "Access-Control-Allow-Origin",
+          "value": "*"
+        },
+        {
+          "key": "Access-Control-Allow-Methods",
+          "value": "GET, OPTIONS"
+        },
+        {
+          "key": "Access-Control-Allow-Headers",
+          "value": "Content-Type"
+        }
+      ]
     }
   ]
 }
